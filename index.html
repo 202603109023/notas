@@ -174,8 +174,9 @@ nav.tabs button[aria-selected=true]{color:var(--ink);border-bottom-color:var(--a
 .modal .actions{display:flex;gap:.5rem;justify-content:flex-end;margin-top:1rem;flex-wrap:wrap}
 .modal textarea.big{height:40vh;font-size:.85rem}
 
-#cover{position:fixed;inset:0;background:var(--bg);z-index:100;display:grid;place-items:end center;padding:0 16px calc(28px + env(safe-area-inset-bottom,0px));cursor:pointer}
-#cover p{color:var(--muted);opacity:.5;font-size:.8rem;margin:0}
+#cover{position:fixed;inset:0;background:var(--bg);z-index:100}
+.note-body.clamp{display:-webkit-box;-webkit-line-clamp:8;-webkit-box-orient:vertical;overflow:hidden;cursor:pointer}
+.reading{white-space:pre-wrap;overflow-wrap:anywhere;font-size:1.05rem;line-height:1.75;margin:0}
 
 @media (max-width:640px){
   .grid2,.grid3{grid-template-columns:1fr}
@@ -204,7 +205,7 @@ nav.tabs button[aria-selected=true]{color:var(--ink);border-bottom-color:var(--a
     <header class="top">
       <h1>Bitácora</h1>
       <span class="status" id="statusLine"></span>
-      <button class="btn" id="coverBtn" type="button" title="También con la tecla Esc">Ocultar</button>
+      <button class="btn" id="coverBtn" type="button" title="Bloquea al instante. También con la tecla Esc">Ocultar</button>
       <button class="btn" id="lockBtn" type="button">Bloquear</button>
     </header>
 
@@ -358,7 +359,7 @@ nav.tabs button[aria-selected=true]{color:var(--ink);border-bottom-color:var(--a
         </label>
         <p id="accessInfo" class="small" style="margin:0"></p>
         <label class="check" id="hideTrailRow"><input type="checkbox" id="hideTrail"> Ocultar el trazo mientras dibujo el patrón</label>
-        <p class="muted small" style="margin:0">El botón Ocultar (o la tecla Esc) tapa la pantalla al instante; toca dos veces para volver. La pantalla también se tapa sola al cambiar de pestaña o aplicación, y se bloquea si pasa más de un minuto así.</p>
+        <p class="muted small" style="margin:0">El botón Ocultar (o la tecla Esc) deja la pantalla vacía y bloquea la bitácora al instante: para volver necesitas tu contraseña o patrón. Lo mismo ocurre al cambiar de pestaña o de aplicación, salvo mientras guardas una copia o eliges un archivo.</p>
         <div class="row"><button class="btn" type="button" id="changePat">Cambiar contraseña o patrón</button></div>
       </div>
       <div class="box stack">
@@ -374,7 +375,7 @@ nav.tabs button[aria-selected=true]{color:var(--ink);border-bottom-color:var(--a
   </div>
 </div>
 
-<div id="cover" hidden><p>Toca dos veces para continuar</p></div>
+<div id="cover" hidden></div>
 <div id="toast" hidden role="status"></div>
 <div id="modalRoot"></div>
 
@@ -1063,35 +1064,59 @@ async function tryUnlock(secret) {
     return `${method === 'password' ? 'Contraseña incorrecta' : 'Patrón incorrecto'}. Intentos fallidos: ${f.count}.`;
   }
 }
+// Where the person was (tab, half-written note, filters, scroll). Saved encrypted with the rest, restored on unlock.
+function captureUI() {
+  const tab = ($$('nav.tabs button').find(b => b.getAttribute('aria-selected') === 'true') || {}).dataset?.tab || 'notas';
+  const v = s => $(s).value;
+  return { tab, editingId, currentList, y: scrollY, cmd: v('#cmdInput'),
+    form: { motivo: v('#fMotivo'), tags: v('#fTags'), texto: v('#fTexto'), fecha: v('#fFecha'), pin: $('#fPin').checked },
+    filters: { nq: v('#nq'), nm: v('#nm'), nt: v('#nt'), nfrom: v('#nfrom'), nto: v('#nto') }, sel: [...selected] };
+}
+function restoreUI(r) {
+  try {
+    const f = r.form || {};
+    if (r.editingId && S.notes.some(n => n.id === r.editingId)) { editNote(r.editingId); }
+    ['motivo', 'tags', 'texto'].forEach(k => { if (f[k] != null) $('#f' + k[0].toUpperCase() + k.slice(1)).value = f[k]; });
+    if (f.fecha) $('#fFecha').value = f.fecha; $('#fPin').checked = !!f.pin;
+    const fl = r.filters || {}; Object.entries(fl).forEach(([k, v]) => { if (v != null) $('#' + k).value = v; });
+    (r.sel || []).forEach(id => { if (S.notes.some(n => n.id === id)) selected.add(id); });
+    if (r.currentList) currentList = r.currentList;
+    $('#cmdInput').value = r.cmd || '';
+    renderAll(); showTab(r.tab || 'notas');
+    requestAnimationFrame(() => scrollTo(0, r.y || 0));
+    return !!(f.texto && f.texto.trim());
+  } catch { return false; }
+}
 async function lock() {
+  if (S && KEY) { S.resume = captureUI(); save(); }
   await saving.catch(() => {});
   S = null; KEY = null; META = null; selected.clear();
   ['#log', '#notesList', '#listView', '#dueBox', '#listSel', '#nm', '#nt', '#exMotivo', '#exTag', '#motivoList', '#modalRoot', '#trashBox', '#tplList', '#tplSel'].forEach(s => $(s).replaceChildren());
   ['#fMotivo', '#fTags', '#fTexto', '#nq', '#nfrom', '#nto', '#exFrom', '#exTo', '#cmdInput'].forEach(s => $(s).value = '');
   editingId = null; currentList = null; lockEntry = null;
-  $('#cover').hidden = true; $('#app').hidden = true; $('#lock').hidden = false;
+  $('#app').hidden = true; $('#lock').hidden = false;
   startLock();
 }
 
-/* ================= Cover, idle & visibility ================= */
-let lastAct = Date.now(), hiddenAt = 0, lastTap = 0;
+/* ================= Hide, idle & visibility ================= */
+let lastAct = Date.now(), externalUntil = 0;
+// While a share sheet, download or file picker is open the page goes to background on purpose: don't lock then
+const externalStart = () => { externalUntil = Date.now() + 5 * 60000; };
+const externalEnd = () => setTimeout(() => { externalUntil = 0; }, 1500);
 ['pointerdown', 'keydown', 'wheel', 'touchstart'].forEach(ev => addEventListener(ev, () => lastAct = Date.now(), { passive: true, capture: true }));
-setInterval(() => { if (S && Date.now() - lastAct > (S.settings.autoLock || 5) * 60000) lock(); }, 5000);
-const cover = () => { if (S) $('#cover').hidden = false; };
+// Hide = blank screen + real lock. Tapping the blank screen only reveals the normal unlock screen.
+function hideNow() { if (!S) return; $('#modalRoot').replaceChildren(); $('#cover').hidden = false; lock(); }
 const uncover = () => { $('#cover').hidden = true; };
-$('#coverBtn').onclick = cover;
-$('#cover').addEventListener('pointerup', () => { const n = Date.now(); if (n - lastTap < 450) { uncover(); lastTap = 0; } else lastTap = n; });
-$('#cover').addEventListener('keydown', e => { if (e.key === 'Enter') uncover(); });
+setInterval(() => { if (S && Date.now() - lastAct > (S.settings.autoLock || 5) * 60000) hideNow(); }, 5000);
+$('#coverBtn').onclick = hideNow;
+$('#cover').addEventListener('click', uncover);
 document.addEventListener('keydown', e => {
-  if (e.key !== 'Escape' || !S || !$('#cover').hidden) return;
+  if (e.key !== 'Escape' || !S) return;
   if ($('#modalRoot').children.length) { $('#modalRoot').replaceChildren(); return; }
   const a = document.activeElement; if (a && a.closest('.task') && a.tagName === 'INPUT' && a.type === 'text') return;
-  cover();
+  hideNow();
 });
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) { hiddenAt = Date.now(); cover(); }
-  else if (S && hiddenAt && Date.now() - hiddenAt > 60000) lock();
-});
+document.addEventListener('visibilitychange', () => { if (document.hidden && S && Date.now() > externalUntil) hideNow(); });
 
 /* ================= App ================= */
 function openApp(isNew) {
@@ -1100,7 +1125,11 @@ function openApp(isNew) {
   $('#lock').hidden = true; $('#app').hidden = false; uncover(); lastAct = Date.now();
   resetNoteForm(); renderAll(); showTab('notas'); updateStatus();
   $('#autoLock').value = String(S.settings.autoLock || 5); $('#hideTrail').checked = !!prefs.hideTrail; updateAccessUI();
+  const resume = S.resume; delete S.resume;
+  const hadDraft = resume ? restoreUI(resume) : false;
+  if (resume) save();
   if (isNew) say('bot', 'Tu bitácora está lista y cifrada. Escribe "ayuda" para ver lo que puedo hacer.');
+  else if (resume) say('bot', hadDraft ? 'Seguimos donde quedaste. Tu nota a medio escribir está en el formulario.' : 'Seguimos donde quedaste.');
   else {
     const { today, late } = dueSummary();
     let t = 'Hola de nuevo.';
@@ -1183,7 +1212,10 @@ function noteCard(n) {
     h('div', { class: 'note-head' }, h('span', { class: 'tag', text: n.motivo }),
       h('span', { class: 'when', text: (n.pinned ? fmtFecha(n.fecha) : fmtHora(n.fecha)) + (n.editado ? ' (editada)' : '') })),
     n.tags.length ? h('div', { class: 'labels' }, n.tags.map(t => h('button', { class: 'label', type: 'button', text: '#' + t, title: 'Ver notas con esta etiqueta', onclick: () => { $('#nt').value = t; renderNotes(); } }))) : null,
-    h('div', { class: 'note-body', text: n.texto }),
+    (() => { const long = n.texto.length > 600 || n.texto.split('\n').length > 10;
+      return long ? [h('div', { class: 'note-body clamp', text: n.texto, title: 'Toca para leerla completa', onclick: () => viewNote(n.id) }),
+        h('p', { style: 'margin:-.2rem 0 .5rem' }, h('button', { class: 'linked', type: 'button', text: `Leer completa (${n.texto.length.toLocaleString('es')} caracteres)`, onclick: () => viewNote(n.id) }))]
+        : h('div', { class: 'note-body', text: n.texto }); })(),
     linked.length ? h('p', { style: 'margin:0 0 .5rem' }, h('button', { class: 'linked', type: 'button', text: `${plural(linked.length, 'tarea vinculada', 'tareas vinculadas')}, ${pend} ${pend === 1 ? 'pendiente' : 'pendientes'}`, onclick: () => showLinked(n) })) : null,
     h('div', { class: 'note-foot' },
       h('label', { class: 'check small' }, h('input', { type: 'checkbox', checked: sel, onchange: e => { e.target.checked ? selected.add(n.id) : selected.delete(n.id); renderNotes(); renderExport(); } }), 'Seleccionar'),
@@ -1216,7 +1248,7 @@ function viewNote(id) {
   if (!n) { toast('Esa nota ya no está en la bitácora (puede estar en la papelera).', true); return; }
   modal({ title: n.motivo, wide: true, body: h('div', { class: 'stack' },
     h('p', { class: 'muted small', style: 'margin:0', text: fmtFecha(n.fecha) + (n.tags.length ? '. Etiquetas: ' + n.tags.join(', ') : '') }),
-    h('div', { class: 'note-body', text: n.texto })),
+    h('div', { class: 'reading', text: n.texto })),
     actions: [{ label: 'Cerrar', kind: 'ghost' }, { label: 'Editar', kind: 'primary', onClick: c => { c(); editNote(n.id); } }] });
 }
 function showHistory(n) {
@@ -1477,6 +1509,10 @@ let DL = null;
 if (window.claude && typeof window.claude.use === 'function') window.claude.use('downloads').then(d => DL = d).catch(() => {});
 // Returns true only when the file was actually handed over for saving
 async function offerFile(filename, data, textFallback) {
+  externalStart();
+  try { return await offerFileInner(filename, data, textFallback); } finally { externalEnd(); }
+}
+async function offerFileInner(filename, data, textFallback) {
   if (window.claude && DL) {
     try { await DL.save({ filename, data }); toast('Archivo listo: ' + filename); return true; }
     catch (e) {
@@ -1525,8 +1561,10 @@ $('#archiveBtn').onclick = async () => {
   if (remove) confirmBox('Archivar y quitar', `Se guardará un archivo cifrado con ${plural(notes.length, 'nota', 'notas')} y luego se quitarán de la bitácora. Guarda bien ese archivo: será la única copia.`, 'Archivar y quitar', go, false);
   else go();
 };
-$('#openArchiveBtn').onclick = () => $('#archiveFile').click();
+$('#openArchiveBtn').onclick = () => { externalStart(); $('#archiveFile').click(); };
+$('#archiveFile').addEventListener('cancel', externalEnd);
 $('#archiveFile').onchange = async e => {
+  externalEnd();
   const f = e.target.files[0]; e.target.value = ''; if (!f) return;
   let rec; try { rec = JSON.parse(await f.text()); } catch { toast('El archivo no es un archivo de Bitácora.', true); return; }
   if (!rec || !rec.salt || !rec.iv || !rec.ct || !rec.iter) { toast('El archivo no es un archivo de Bitácora.', true); return; }
@@ -1566,18 +1604,20 @@ $('#backupBtn').onclick = async () => {
   await saving.catch(() => {}); const v = store.get(VAULT); if (!v) { toast('No hay nada guardado todavía.', true); return; }
   const name = `bitacora-respaldo-${todayStr()}.json`;
   if (/Android|iPhone|iPad/i.test(navigator.userAgent) && navigator.canShare) {
-    try {
-      const file = new File([v], name, { type: 'application/json' });
-      if (navigator.canShare({ files: [file] })) {
-        await navigator.share({ files: [file], title: name });
-        prefs.lastBackup = Date.now(); savePrefs(); toast('Copia enviada. Revisa que quedó guardada en Drive.'); return;
-      }
-    } catch (e) { if (e && e.name === 'AbortError') { toast('Copia cancelada'); return; } }
+    const file = new File([v], name, { type: 'application/json' });
+    if (navigator.canShare({ files: [file] })) {
+      externalStart();
+      try { await navigator.share({ files: [file], title: name }); toast('Copia enviada. Revisa que quedó guardada en Drive.'); return; }
+      catch (e) { if (e && e.name === 'AbortError') { toast('Copia cancelada'); return; } }
+      finally { externalEnd(); }
+    }
   }
-  if (await offerFile(name, v, v)) { prefs.lastBackup = Date.now(); savePrefs(); }
+  offerFile(name, v, v);
 };
-$('#restoreBtn').onclick = () => $('#restoreFile').click();
+$('#restoreBtn').onclick = () => { externalStart(); $('#restoreFile').click(); };
+$('#restoreFile').addEventListener('cancel', externalEnd);
 $('#restoreFile').onchange = async e => {
+  externalEnd();
   const f = e.target.files[0]; e.target.value = ''; if (!f) return;
   let rec; try { rec = JSON.parse(await f.text()); } catch { toast('El archivo no es una copia válida.', true); return; }
   if (!rec || !rec.salt || !rec.iv || !rec.ct || !rec.iter) { toast('El archivo no es una copia de Bitácora.', true); return; }
@@ -1777,7 +1817,7 @@ function runCommand(raw) {
       const c = k => S.trash.filter(e => e.kind === k).length;
       return say('bot', `En la papelera hay ${[c('note') ? plural(c('note'), 'nota', 'notas') : '', c('task') ? plural(c('task'), 'tarea', 'tareas') : '', c('list') ? plural(c('list'), 'lista', 'listas') : ''].filter(Boolean).join(', ')}. Te la abrí abajo.`);
     }
-    case 'ocultar': case 'tapar': return cover();
+    case 'ocultar': case 'tapar': return hideNow();
     case 'bloquear': case 'salir': case 'cerrar': return lock();
     case 'ayuda': case 'help': case 'comandos':
       return say('bot', [h('div', { text: 'Esto es lo que entiendo:' }), h('ul', null, HELP.map(([c, d]) => h('li', null, h('b', { text: c }), ': ' + d)))]);
